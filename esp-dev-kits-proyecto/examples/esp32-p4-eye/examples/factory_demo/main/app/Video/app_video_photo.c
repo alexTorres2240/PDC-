@@ -24,7 +24,7 @@ static const char *TAG = "app_video_photo";
 #define DEBUG_MODE              0
 #define CROP_PHOTO_WIDTH        1280
 #define CROP_PHOTO_HEIGHT       960
-#define JPEG_PHOTO_QUALITY      90            // JPEG quality setting
+#define JPEG_PHOTO_QUALITY      90             // JPEG quality setting
 
 /* Static variables */
 static size_t data_cache_line_size = 0;
@@ -113,7 +113,6 @@ esp_err_t take_and_save_photo(uint8_t *camera_buf, uint32_t width, uint32_t heig
     uint8_t *pic_buf = NULL;
 
     bsp_display_backlight_off();
-    
     bsp_flashlight_set(app_video_stream_get_flash_light_state());
 
     uint32_t photo_width = photo_resolution_width[current_resolution];

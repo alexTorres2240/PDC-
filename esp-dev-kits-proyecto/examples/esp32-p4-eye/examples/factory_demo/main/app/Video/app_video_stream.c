@@ -30,6 +30,7 @@
 #include "app_ai_detect.h"
 #include "app_qma6100.h"
 
+
 /* Constants */
 #define ALIGN_UP(num, align)    (((num) + ((align) - 1)) & ~((align) - 1))
 #define JPEG_COMPRESSION_RATIO  5             // Assuming 5:1 compression ratio
@@ -397,6 +398,22 @@ esp_err_t app_video_stream_init(i2c_master_bus_handle_t i2c_handle)
         app_isp_set_hue(loaded_hue);
     }
 
+    // Reserve the two large MIPI-CSI frame buffers BEFORE other PSRAM buffers.
+    // This helps avoid insufficient contiguous memory for 1080P capture.
+    ESP_LOGI(TAG, "PSRAM before CSI: free=%u, largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+
+    ret = app_video_set_bufs(camera_buffer.video_cam_fd, EXAMPLE_CAM_BUF_NUM, NULL);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set video buffers: 0x%x", ret);
+        goto cleanup;
+    }
+
+    ESP_LOGI(TAG, "CSI frame buffers reserved: free PSRAM=%u, largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+
     // Allocate canvas buffers
     for (int i = 0; i < EXAMPLE_CAM_BUF_NUM; i++) {
         camera_buffer.canvas_buf[i] = heap_caps_aligned_calloc(data_cache_line_size, 1, 
@@ -455,13 +472,6 @@ esp_err_t app_video_stream_init(i2c_master_bus_handle_t i2c_handle)
     if (camera_buffer.jpg_buf == NULL) {
         ESP_LOGE(TAG, "Failed to allocate JPEG buffer");
         ret = ESP_FAIL;
-        goto cleanup;
-    }
-
-    // Initialize video capture device
-    ret = app_video_set_bufs(camera_buffer.video_cam_fd, EXAMPLE_CAM_BUF_NUM, NULL);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set video buffers: 0x%x", ret);
         goto cleanup;
     }
 
@@ -671,12 +681,12 @@ static void camera_video_frame_operation(uint8_t *camera_buf, uint8_t camera_buf
     // Handle photo request
     if (camera_state.flags.is_initialized) {
         // Handle photo request
-        if (camera_state.flags.is_take_photo && 
-            (ui_extra_get_current_page() == UI_PAGE_CAMERA || ui_extra_get_current_page() == UI_PAGE_INTERVAL_CAM)) {
-            // Reset photo flag and take a photo
+        if (camera_state.flags.is_take_photo &&
+            (ui_extra_get_current_page() == UI_PAGE_CAMERA ||
+             ui_extra_get_current_page() == UI_PAGE_INTERVAL_CAM)) {
             camera_state.flags.is_take_photo = false;
             take_and_save_photo(camera_buf, camera_buf_hes, camera_buf_ves);
-        } 
+        }
         // Handle video request
         else if (camera_state.flags.is_take_video && ui_extra_get_current_page() == UI_PAGE_VIDEO_MODE) {
             take_and_save_video(camera_buf, camera_buf_hes, camera_buf_ves);
