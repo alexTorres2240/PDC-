@@ -1,5 +1,0 @@
-Copia de ambos .c al directorio de tu proyecto: main\app\Video\
-Se ha movido la reserva de los buffers de captura CSI antes de las reservas de imagen y YOLO.
-Se conserva JPEG calidad 90 y compression ratio 5.
-Haz copia de seguridad de los originales antes de reemplazarlos.
-Compila con 'idf.py build' y, solo si termina correctamente, graba con 'idf.py -p COM38 flash'.

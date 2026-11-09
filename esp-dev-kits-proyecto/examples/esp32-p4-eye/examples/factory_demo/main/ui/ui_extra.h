@@ -34,6 +34,7 @@ typedef enum {
     UI_PAGE_USB_DISK,       // USB disk page
     UI_PAGE_SETTINGS,       // Settings page
     UI_PAGE_AI_DETECT,      // AI detect page
+    UI_PAGE_VPR,            // Visual Place Recognition
     UI_PAGE_MAX             // Page count
 } ui_page_t;
 
@@ -83,6 +84,17 @@ void ui_extra_btn_left(void);
  * @brief Encoder button handler
  */
 void ui_extra_btn_encoder(void);
+
+/* VPR_UI_FASE1: API del nuevo menu de localizacion visual.
+   Las funciones que modifican LVGL deben llamarse con el bloqueo de pantalla. */
+typedef enum {
+    VPR_MODO_CLASIFICACION = 0,
+    VPR_MODO_REGRESION = 1
+} vpr_modo_t;
+
+vpr_modo_t ui_extra_vpr_get_mode(void);
+void ui_extra_vpr_set_status(const char *mensaje);
+void ui_extra_vpr_set_coordinates(float x, float y, bool valid);
 
 /* Page management */
 /**

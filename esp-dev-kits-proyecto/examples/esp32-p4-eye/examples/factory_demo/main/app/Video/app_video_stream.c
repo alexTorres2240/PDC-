@@ -679,17 +679,64 @@ static void camera_video_frame_operation(uint8_t *camera_buf, uint8_t camera_buf
 
 
     // Handle photo request
+    
+    // Control del flash sin bloquear la camara
+    static int64_t flash_inicio_us = 0;
+
+    // Apagar el flash si se cancela la captura
+    bool pagina_foto =
+        ui_extra_get_current_page() == UI_PAGE_CAMERA ||
+        ui_extra_get_current_page() == UI_PAGE_INTERVAL_CAM;
+
+    if ((!camera_state.flags.is_take_photo || !pagina_foto) &&
+        flash_inicio_us != 0) {
+        bsp_flashlight_set(false);
+        flash_inicio_us = 0;
+    }
+
     if (camera_state.flags.is_initialized) {
-        // Handle photo request
-        if (camera_state.flags.is_take_photo &&
-            (ui_extra_get_current_page() == UI_PAGE_CAMERA ||
-             ui_extra_get_current_page() == UI_PAGE_INTERVAL_CAM)) {
-            camera_state.flags.is_take_photo = false;
-            take_and_save_photo(camera_buf, camera_buf_hes, camera_buf_ves);
+
+        if (camera_state.flags.is_take_photo && pagina_foto) {
+
+            bool captura_lista = true;
+
+            if (camera_state.flags.is_flash_light_on) {
+
+                // Encender flash una sola vez
+                if (flash_inicio_us == 0) {
+                    bsp_flashlight_set(true);
+                    flash_inicio_us = esp_timer_get_time();
+
+                    ESP_LOGI(TAG, "Flash encendido, esperando exposicion");
+                }
+
+                // Esperar 500 ms mientras llegan fotogramas nuevos
+                captura_lista =
+                    (esp_timer_get_time() - flash_inicio_us >= 500000LL);
+            }
+
+            if (captura_lista) {
+                camera_state.flags.is_take_photo = false;
+                flash_inicio_us = 0;
+
+                ESP_LOGI(TAG, "Capturando fotografia");
+
+                take_and_save_photo(
+                    camera_buf,
+                    camera_buf_hes,
+                    camera_buf_ves
+                );
+            }
         }
-        // Handle video request
-        else if (camera_state.flags.is_take_video && ui_extra_get_current_page() == UI_PAGE_VIDEO_MODE) {
-            take_and_save_video(camera_buf, camera_buf_hes, camera_buf_ves);
+        else if (camera_state.flags.is_take_video &&
+                 ui_extra_get_current_page() == UI_PAGE_VIDEO_MODE) {
+
+            take_and_save_video(
+                camera_buf,
+                camera_buf_hes,
+                camera_buf_ves
+            );
         }
     }
+
 }

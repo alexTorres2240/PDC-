@@ -59,6 +59,11 @@ static bool is_ui_init = false;
 // AI Detection Mode variables
 static ai_detect_mode_t current_ai_detect_mode = AI_DETECT_PEDESTRIAN;
 static lv_obj_t *ai_mode_label = NULL;
+/* VPR_UI_FASE1: solo interfaz, las CNN aun no reciben fotogramas */
+static lv_obj_t *vpr_title_label = NULL;
+static lv_obj_t *vpr_coords_label = NULL;
+static lv_obj_t *vpr_help_label = NULL;
+static vpr_modo_t vpr_modo = VPR_MODO_CLASIFICACION;
 
 // UI settings
 static uint16_t magnification_factor = DEFAULT_MAGNIFICATION_FACTOR;
@@ -119,6 +124,7 @@ static const PageMapping page_map[] = {
     {"INTERVAL CAM", UI_PAGE_INTERVAL_CAM},
     {"VIDEO MODE", UI_PAGE_VIDEO_MODE},
     {"AI DETECT", UI_PAGE_AI_DETECT},
+    {"VPR", UI_PAGE_VPR},
     {"ALBUM", UI_PAGE_ALBUM},
     {"USB DISK", UI_PAGE_USB_DISK},
     {"SETTINGS", UI_PAGE_SETTINGS},
@@ -127,6 +133,8 @@ static const PageMapping page_map[] = {
 
 /* Forward declarations */
 static void ui_extra_redirect_to_main_page(void);
+static void ui_extra_redirect_to_vpr_page(void);
+static void vpr_update_mode_label(void);
 static void ui_extra_redirect_to_camera_page(void);
 static void ui_extra_redirect_to_interval_camera_page(void);
 static void ui_extra_redirect_to_video_mode_page(void);
@@ -783,7 +791,7 @@ static void lv_scroll_create(void)
     lv_label_set_text(info_label, "");  
 
     const char* btn_texts[] = {
-        "CAMERA", "INTERVAL CAM", "VIDEO MODE", "AI DETECT","ALBUM", 
+        "CAMERA", "INTERVAL CAM", "VIDEO MODE", "AI DETECT", "VPR", "ALBUM", 
         "USB DISK", "SETTINGS"
     };
 
@@ -793,6 +801,7 @@ static void lv_scroll_create(void)
         &ui_img_interval_big_png,
         &ui_img_video_big_png,
         &ui_img_ai_detect_png,
+        &ui_img_ai_detect_png, // Icono provisional VPR
         &ui_img_album_big_png,
         &ui_img_usb_big_png,
         &ui_img_settings_big_png,
@@ -862,6 +871,10 @@ void ui_extra_clear_page(void)
     lv_obj_add_flag(scroll_cont, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(info_label, LV_OBJ_FLAG_HIDDEN);
     
+    if (vpr_title_label) lv_obj_add_flag(vpr_title_label, LV_OBJ_FLAG_HIDDEN);
+    if (vpr_coords_label) lv_obj_add_flag(vpr_coords_label, LV_OBJ_FLAG_HIDDEN);
+    if (vpr_help_label) lv_obj_add_flag(vpr_help_label, LV_OBJ_FLAG_HIDDEN);
+
     // Hide AI mode label if it exists
     if (ai_mode_label != NULL) {
         lv_obj_add_flag(ai_mode_label, LV_OBJ_FLAG_HIDDEN);
@@ -901,6 +914,83 @@ static void ui_extra_clear_popup_window(void)
             if (current_page == UI_PAGE_AI_DETECT && ai_mode_label != NULL) {
                 lv_obj_clear_flag(ai_mode_label, LV_OBJ_FLAG_HIDDEN);
             }
+    }
+}
+
+/* VPR_UI_FASE1: entorno de seleccion y salida en pantalla. */
+static void vpr_update_mode_label(void)
+{
+    if (!vpr_title_label) return;
+    lv_label_set_text(vpr_title_label,
+        vpr_modo == VPR_MODO_CLASIFICACION ? "VPR | CLASIFICACION" : "VPR | REGRESION");
+    if (vpr_coords_label) {
+        lv_label_set_text(vpr_coords_label, "X: --  Y: --");
+    }
+}
+
+static void ui_extra_redirect_to_vpr_page(void)
+{
+    current_page = UI_PAGE_VPR;
+    ui_extra_clear_page();
+
+    if (!vpr_title_label) {
+        vpr_title_label = lv_label_create(ui_ScreenCamera);
+        lv_obj_set_style_text_font(vpr_title_label, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(vpr_title_label, lv_color_hex(0xffffff), 0);
+        lv_obj_set_style_bg_color(vpr_title_label, lv_color_hex(0x162337), 0);
+        lv_obj_set_style_bg_opa(vpr_title_label, LV_OPA_80, 0);
+        lv_obj_set_style_radius(vpr_title_label, 5, 0);
+        lv_obj_set_style_pad_all(vpr_title_label, 5, 0);
+        lv_obj_align(vpr_title_label, LV_ALIGN_TOP_LEFT, 4, 5);
+    }
+    if (!vpr_coords_label) {
+        vpr_coords_label = lv_label_create(ui_ScreenCamera);
+        lv_obj_set_style_text_font(vpr_coords_label, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(vpr_coords_label, lv_color_hex(0x00ffcc), 0);
+        lv_obj_set_style_bg_color(vpr_coords_label, lv_color_hex(0x162337), 0);
+        lv_obj_set_style_bg_opa(vpr_coords_label, LV_OPA_80, 0);
+        lv_obj_set_style_radius(vpr_coords_label, 5, 0);
+        lv_obj_set_style_pad_all(vpr_coords_label, 5, 0);
+        lv_obj_align(vpr_coords_label, LV_ALIGN_TOP_LEFT, 4, 39);
+    }
+    if (!vpr_help_label) {
+        vpr_help_label = lv_label_create(ui_ScreenCamera);
+        lv_obj_set_style_text_font(vpr_help_label, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(vpr_help_label, lv_color_hex(0xffffff), 0);
+        lv_obj_set_style_bg_color(vpr_help_label, lv_color_hex(0x162337), 0);
+        lv_obj_set_style_bg_opa(vpr_help_label, LV_OPA_80, 0);
+        lv_obj_set_style_pad_all(vpr_help_label, 4, 0);
+        lv_obj_align(vpr_help_label, LV_ALIGN_BOTTOM_LEFT, 4, -5);
+    }
+    lv_label_set_text(vpr_help_label, "UP/DOWN: modelo  MENU: salir\nSin inferencia en esta fase");
+    vpr_update_mode_label();
+    lv_obj_clear_flag(vpr_title_label, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(vpr_coords_label, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(vpr_help_label, LV_OBJ_FLAG_HIDDEN);
+}
+
+vpr_modo_t ui_extra_vpr_get_mode(void)
+{
+    return vpr_modo;
+}
+
+/* Llamar solo bajo bsp_display_lock() desde tareas ajenas a LVGL. */
+void ui_extra_vpr_set_status(const char *mensaje)
+{
+    if (current_page == UI_PAGE_VPR && vpr_help_label && mensaje) {
+        lv_label_set_text(vpr_help_label, mensaje);
+    }
+}
+
+void ui_extra_vpr_set_coordinates(float x, float y, bool valid)
+{
+    if (current_page != UI_PAGE_VPR || !vpr_coords_label) return;
+    if (!valid) {
+        lv_label_set_text(vpr_coords_label, "X: --  Y: --");
+    } else if (vpr_modo == VPR_MODO_CLASIFICACION) {
+        lv_label_set_text_fmt(vpr_coords_label, "X: %.0f  Y: %.0f", x, y);
+    } else {
+        lv_label_set_text_fmt(vpr_coords_label, "X: %.2f  Y: %.2f", x, y);
     }
 }
 
@@ -1175,6 +1265,9 @@ void ui_extra_goto_page(ui_page_t page)
             break;
         case UI_PAGE_AI_DETECT:
             ui_extra_redirect_to_ai_detect_page();
+            break;
+        case UI_PAGE_VPR:
+            ui_extra_redirect_to_vpr_page();
             break;
         default:
             ui_extra_redirect_to_main_page();
@@ -1562,6 +1655,12 @@ void ui_extra_btn_up(void)
             }
             break;
             
+        case UI_PAGE_VPR:
+            vpr_modo = (vpr_modo == VPR_MODO_CLASIFICACION)
+                         ? VPR_MODO_REGRESION : VPR_MODO_CLASIFICACION;
+            vpr_update_mode_label();
+            break;
+
         case UI_PAGE_AI_DETECT:
             // Switch to previous AI detection mode (cycle back to the last if at first)
             if (current_ai_detect_mode == AI_DETECT_PEDESTRIAN) {
@@ -1643,6 +1742,12 @@ void ui_extra_btn_down(void)
             }
             break;
             
+        case UI_PAGE_VPR:
+            vpr_modo = (vpr_modo == VPR_MODO_CLASIFICACION)
+                         ? VPR_MODO_REGRESION : VPR_MODO_CLASIFICACION;
+            vpr_update_mode_label();
+            break;
+
         case UI_PAGE_AI_DETECT:
             // Switch to next AI detection mode (cycle to the first if at last)
             if (current_ai_detect_mode == AI_DETECT_FACE) {
@@ -1809,6 +1914,9 @@ void ui_extra_btn_menu(void)
 
     // Perform different actions based on current page
     switch(current_page) {
+        case UI_PAGE_VPR:
+            ui_extra_goto_page(UI_PAGE_MAIN);
+            break;
         case UI_PAGE_MAIN:
             ui_extra_goto_page(ui_extra_get_choosed_page());
             break;
@@ -1928,7 +2036,7 @@ void ui_extra_btn_encoder(void)
         return;
     }
 
-    if(!is_sd_card_mounted) {
+    if(!is_sd_card_mounted && current_page != UI_PAGE_VPR) {
         switch(current_page) {
             case UI_PAGE_CAMERA:
             case UI_PAGE_INTERVAL_CAM:
@@ -1952,6 +2060,11 @@ void ui_extra_btn_encoder(void)
     }
 
     switch(current_page) {
+        case UI_PAGE_VPR:
+            vpr_modo = (vpr_modo == VPR_MODO_CLASIFICACION)
+                         ? VPR_MODO_REGRESION : VPR_MODO_CLASIFICACION;
+            vpr_update_mode_label();
+            break;
         case UI_PAGE_MAIN:
             ui_extra_btn_menu();
             break;

@@ -20,10 +20,15 @@
 #include "app_ai_detect.h"
 #include "app_qma6100.h"
 
+#include "app_vpr.h"
+
+
 static const char *TAG = "main";
 
 void app_main(void)
 {
+    //probar_modelo_vpr();
+
     // Initialize NVS
     ESP_LOGI(TAG, "Initialize NVS");
     esp_err_t ret = nvs_flash_init();
@@ -79,4 +84,5 @@ void app_main(void)
     ESP_ERROR_CHECK(app_video_stream_init(i2c_handle));
     
     ESP_LOGI(TAG, "Application initialization completed");
+
 }
