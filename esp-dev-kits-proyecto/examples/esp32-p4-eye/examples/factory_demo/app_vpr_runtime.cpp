@@ -1,0 +1,277 @@
+/* VPR Fase 2: imagen real -> CNN cuantizada -> coordenadas LVGL.
+ * ESP-IDF 5.5.x / ESP-DL 3.1.3. Este es un prototipo experimental.
+ * Datos del entrenamiento: 224x224, RGB, [0,1].
+ * Se usa la vista previa RGB565 240x240 de la camara (no el frame completo).
+ */
+#include "app_vpr_runtime.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+#include <new>
+#include <inttypes.h>
+
+#include "dl_model_base.hpp"
+#include "esp_heap_caps.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "bsp/esp-bsp.h"
+#include "ui_extra.h"
+
+#if defined(__has_include)
+#  if __has_include("vpr_coords_map.h")
+#    include "vpr_coords_map.h"
+#    define VPR_HAY_MAPA 1
+#  else
+#    define VPR_HAY_MAPA 0
+#  endif
+#else
+#  define VPR_HAY_MAPA 0
+#endif
+
+extern const uint8_t modelo_regresion[] asm("_binary_cnn_regresion_v1_1_espdl_start");
+extern const uint8_t modelo_clasificacion[] asm("_binary_cnn_classificacion_v1_1_espdl_start");
+
+static const char *TAG = "VPR_RUN";
+static constexpr int SRC_W = 240;
+static constexpr int SRC_H = 240;
+static constexpr int DST_W = 224;
+static constexpr int DST_H = 224;
+static constexpr size_t SNAP_BYTES = SRC_W * SRC_H * 2;
+
+/* Indices: VPR_MODO_CLASIFICACION=0; VPR_MODO_REGRESION=1. */
+static dl::Model *s_modelos[2] = {nullptr, nullptr};
+static uint8_t *s_snapshot = nullptr;
+static SemaphoreHandle_t s_lock = nullptr;
+static bool s_snapshot_pendiente = false;
+static bool s_tarea_iniciada = false;
+static int64_t s_ultima_captura_us = 0;
+
+static bool tensor_valido(dl::TensorBase *t, size_t minimo)
+{
+    return t && t->data && t->get_element_ptr() && (size_t)t->get_size() >= minimo;
+}
+
+static dl::Model *cargar_modelo(const char *nombre, const uint8_t *datos, int salida_minima)
+{
+    ESP_LOGI(TAG, "Cargando %s; PSRAM libre=%u KB, mayor=%u KB", nombre,
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024));
+
+    dl::Model *m = new (std::nothrow) dl::Model(
+        (const char *)datos, fbs::MODEL_LOCATION_IN_FLASH_RODATA);
+    if (!m) {
+        ESP_LOGE(TAG, "Sin memoria para crear %s", nombre);
+        return nullptr;
+    }
+    auto &entradas = m->get_inputs();
+    auto &salidas = m->get_outputs();
+    if (entradas.size() != 1 || salidas.size() != 1 ||
+        !tensor_valido(entradas.begin()->second, DST_W * DST_H * 3) ||
+        !tensor_valido(salidas.begin()->second, salida_minima)) {
+        ESP_LOGE(TAG, "%s: tensores no reservados o incompatibles. Se desactiva el modelo.", nombre);
+        delete m;
+        return nullptr;
+    }
+    dl::TensorBase *input = entradas.begin()->second;
+    dl::TensorBase *output = salidas.begin()->second;
+    if (input->dtype != dl::DATA_TYPE_INT8 || input->shape.size() != 4 ||
+        input->shape[0] != 1 || input->shape[1] != DST_H ||
+        input->shape[2] != DST_W || input->shape[3] != 3) {
+        ESP_LOGE(TAG, "%s: entrada no es [1,224,224,3] INT8", nombre);
+        delete m;
+        return nullptr;
+    }
+    ESP_LOGI(TAG, "%s OK: input exp=%d, salida tipo=%d exp=%d, PSRAM libre=%u KB",
+             nombre, input->exponent, (int)output->dtype, output->exponent,
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+    return m;
+}
+
+extern "C" void vpr_runtime_preload(void)
+{
+    if (s_lock) return;
+    s_lock = xSemaphoreCreateMutex();
+    if (!s_lock) {
+        ESP_LOGE(TAG, "No se pudo crear mutex VPR");
+        return;
+    }
+
+    /* Reservar antes de CSI/AI: comprobado que cargar clasificacion al final
+       puede fallar al no existir un bloque PSRAM de 1176 KB. */
+    s_modelos[VPR_MODO_CLASIFICACION] = cargar_modelo("clasificacion", modelo_clasificacion, 253);
+    s_modelos[VPR_MODO_REGRESION] = cargar_modelo("regresion", modelo_regresion, 2);
+
+    s_snapshot = (uint8_t *)heap_caps_malloc(SNAP_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_snapshot) ESP_LOGE(TAG, "No se pudo reservar snapshot VPR de %u bytes", (unsigned)SNAP_BYTES);
+}
+
+static inline uint16_t pixel_565(const uint8_t *img, int x, int y)
+{
+    const size_t i = (size_t)(y * SRC_W + x) * 2;
+    return (uint16_t)img[i] | ((uint16_t)img[i + 1] << 8);
+}
+
+static inline void unpack_rgb(uint16_t pix, float rgb[3])
+{
+    /* RGB565 little-endian, ANTES del swap que hace LVGL. */
+    rgb[0] = (float)((pix >> 11) & 31) * (255.0f / 31.0f);
+    rgb[1] = (float)((pix >> 5) & 63) * (255.0f / 63.0f);
+    rgb[2] = (float)(pix & 31) * (255.0f / 31.0f);
+}
+
+/* Interpolacion bilineal 240->224, aproximacion a cv2.resize INTER_LINEAR. */
+static void preparar_entrada(dl::TensorBase *input, const uint8_t *imagen)
+{
+    int8_t *dest = input->get_element_ptr<int8_t>();
+    const float inv_scale = DL_RESCALE(input->exponent);
+    for (int y = 0; y < DST_H; ++y) {
+        float sy = ((float)y + 0.5f) * SRC_H / DST_H - 0.5f;
+        int y0 = (int)floorf(sy);
+        float ay = sy - y0;
+        if (y0 < 0) { y0 = 0; ay = 0; }
+        if (y0 >= SRC_H - 1) { y0 = SRC_H - 2; ay = 1; }
+        for (int x = 0; x < DST_W; ++x) {
+            float sx = ((float)x + 0.5f) * SRC_W / DST_W - 0.5f;
+            int x0 = (int)floorf(sx);
+            float ax = sx - x0;
+            if (x0 < 0) { x0 = 0; ax = 0; }
+            if (x0 >= SRC_W - 1) { x0 = SRC_W - 2; ax = 1; }
+            float a[3], b[3], c[3], d[3];
+            unpack_rgb(pixel_565(imagen, x0, y0), a);
+            unpack_rgb(pixel_565(imagen, x0+1, y0), b);
+            unpack_rgb(pixel_565(imagen, x0, y0+1), c);
+            unpack_rgb(pixel_565(imagen, x0+1, y0+1), d);
+            const size_t base = ((size_t)y * DST_W + x) * 3;
+            for (int ch = 0; ch < 3; ++ch) {
+                const float arriba = a[ch] + ax * (b[ch] - a[ch]);
+                const float abajo = c[ch] + ax * (d[ch] - c[ch]);
+                const float valor = (arriba + ay * (abajo - arriba)) / 255.0f;
+                dest[base + ch] = dl::quantize<int8_t>(valor, inv_scale);
+            }
+        }
+    }
+}
+
+static float leer_salida(dl::TensorBase *t, int indice)
+{
+    if (t->dtype == dl::DATA_TYPE_FLOAT) return t->get_element_ptr<float>()[indice];
+    if (t->dtype == dl::DATA_TYPE_INT8)
+        return ldexpf((float)t->get_element_ptr<int8_t>()[indice], t->exponent);
+    if (t->dtype == dl::DATA_TYPE_INT16)
+        return ldexpf((float)t->get_element_ptr<int16_t>()[indice], t->exponent);
+    return NAN;
+}
+
+static void mostrar(const char *estado, float x, float y, bool valida)
+{
+    if (bsp_display_lock(100)) {
+        ui_extra_vpr_set_coordinates(x, y, valida);
+        ui_extra_vpr_set_status(estado);
+        bsp_display_unlock();
+    }
+}
+
+static void tarea_vpr(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "Tarea VPR iniciada (1 captura/s en la pagina VPR)");
+    while (true) {
+        if (ui_extra_get_current_page() != UI_PAGE_VPR || !s_lock || !s_snapshot) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+        vpr_modo_t modo = ui_extra_vpr_get_mode();
+        dl::Model *modelo = (modo == VPR_MODO_CLASIFICACION || modo == VPR_MODO_REGRESION)
+                              ? s_modelos[modo] : nullptr;
+        if (!modelo) {
+            mostrar("Modelo no disponible (PSRAM)", 0, 0, false);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+        if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(20)) != pdTRUE) {
+            vTaskDelay(pdMS_TO_TICKS(30));
+            continue;
+        }
+        if (!s_snapshot_pendiente) {
+            xSemaphoreGive(s_lock);
+            vTaskDelay(pdMS_TO_TICKS(30));
+            continue;
+        }
+        s_snapshot_pendiente = false;
+        dl::TensorBase *input = modelo->get_input();
+        preparar_entrada(input, s_snapshot);
+        xSemaphoreGive(s_lock);
+
+        const int64_t inicio_us = esp_timer_get_time();
+        modelo->run();
+        const unsigned tiempo_ms = (unsigned)((esp_timer_get_time() - inicio_us) / 1000);
+        dl::TensorBase *salida = modelo->get_output();
+        if (!salida || !salida->data) {
+            mostrar("Error de salida CNN", 0, 0, false);
+            continue;
+        }
+        char estado[92];
+        float x = 0, y = 0;
+        bool valido = false;
+        if (modo == VPR_MODO_REGRESION) {
+            const float xn = leer_salida(salida, 0);
+            const float yn = leer_salida(salida, 1);
+            /* Rango del entrenamiento: min=[1,1], max=[8,32]. */
+            x = xn * 7.0f + 1.0f;
+            y = yn * 31.0f + 1.0f;
+            valido = isfinite(x) && isfinite(y);
+            snprintf(estado, sizeof(estado), "REG: %u ms | 1 fotograma/s", tiempo_ms);
+            ESP_LOGI(TAG, "REG: X=%.3f Y=%.3f, %u ms", x, y, tiempo_ms);
+        } else {
+            int clase = -1;
+            float mejor = -INFINITY;
+            for (int i = 0; i < 253; ++i) {
+                float prob = leer_salida(salida, i);
+                if (isfinite(prob) && prob > mejor) {
+                    mejor = prob;
+                    clase = i;
+                }
+            }
+#if VPR_HAY_MAPA
+            if (clase >= 0 && clase < 253) {
+                x = (float)vpr_clase_a_coord[clase][0];
+                y = (float)vpr_clase_a_coord[clase][1];
+                valido = true;
+            }
+            snprintf(estado, sizeof(estado), "CLASE: %d | %u ms", clase, tiempo_ms);
+#else
+            snprintf(estado, sizeof(estado), "Clase: %d | falta mapa X,Y", clase);
+#endif
+            ESP_LOGI(TAG, "CLAS: clase=%d, %u ms, mapa=%d", clase, tiempo_ms, VPR_HAY_MAPA);
+        }
+        /* No sobreescribir con resultados del modo anterior si el usuario cambio. */
+        if (modo == ui_extra_vpr_get_mode() && ui_extra_get_current_page() == UI_PAGE_VPR)
+            mostrar(estado, x, y, valido);
+    }
+}
+
+extern "C" void vpr_runtime_start(void)
+{
+    if (s_tarea_iniciada || !s_lock || !s_snapshot) return;
+    BaseType_t ok = xTaskCreatePinnedToCore(tarea_vpr, "VPR_inferencia", 8192, nullptr, 3, nullptr, 1);
+    s_tarea_iniciada = (ok == pdPASS);
+    if (!s_tarea_iniciada) ESP_LOGE(TAG, "No se pudo crear tarea VPR");
+}
+
+extern "C" void vpr_runtime_offer_frame(const uint8_t *rgb565, int width, int height)
+{
+    if (!s_tarea_iniciada || !s_lock || !s_snapshot || !rgb565 || width != SRC_W || height != SRC_H)
+        return;
+    if (ui_extra_get_current_page() != UI_PAGE_VPR) return;
+    const int64_t ahora = esp_timer_get_time();
+    if (ahora - s_ultima_captura_us < 1000000LL) return;
+    if (xSemaphoreTake(s_lock, 0) != pdTRUE) return;  /* no bloquear hilo de camara */
+    memcpy(s_snapshot, rgb565, SNAP_BYTES);
+    s_snapshot_pendiente = true;
+    s_ultima_captura_us = ahora;
+    xSemaphoreGive(s_lock);
+}

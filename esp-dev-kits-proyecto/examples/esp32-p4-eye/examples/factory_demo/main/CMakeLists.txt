@@ -51,7 +51,7 @@ set(embed_files
     "${CMAKE_CURRENT_LIST_DIR}/../models_vpr/cnn_regresion_v1_1.espdl"
 )
 
-idf_component_register(SRCS "main.c" "app_vpr.cpp" ${LV_UI_SOURCES} ${APP_ALL_SOURCES} 
+idf_component_register(SRCS "app_vpr_runtime.cpp" "main.c" "app_vpr.cpp" ${LV_UI_SOURCES} ${APP_ALL_SOURCES} 
                     INCLUDE_DIRS "." ${LV_UI_DIR} ${APP_DIR} ${APP_DIR}/AI ${APP_DIR}/Video
                     REQUIRES esp_driver_ppa nvs_flash human_face_detect pedestrian_detect coco_detect esp_painter)
 

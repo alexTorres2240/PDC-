@@ -1,0 +1,249 @@
+/* VPR_JERARQUICO_FASE4 - prototipo experimental ESP-IDF 5.5.5 / ESP-DL 3.1.3.
+ * CONDICIONES:
+ * - Los cinco modelos .espdl deben estar flasheados en vpr_main/vpr_c0..vpr_c3.
+ * - Se preserva el menú VPR y las funciones vpr_runtime_* existentes.
+ * - Se mantienen solamente CNN principal y UN regresor en RAM.
+ * - La carga desde partición y el reemplazo de regresor deben validarse en hardware.
+ */
+#include "app_vpr_runtime.h"
+#include "vpr_jerarquico_config.h"
+
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <new>
+
+#include "dl_model_base.hpp"
+#include "esp_heap_caps.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "bsp/esp-bsp.h"
+#include "ui_extra.h"
+
+static const char *TAG = "VPR_JER";
+static constexpr int SRC_W = 240;
+static constexpr int SRC_H = 240;
+static constexpr int DST_W = 224;
+static constexpr int DST_H = 224;
+static constexpr size_t SNAP_BYTES = SRC_W * SRC_H * 2;
+
+static const char *ETIQUETAS_REG[4] = {"vpr_c0", "vpr_c1", "vpr_c2", "vpr_c3"};
+static dl::Model *s_principal = nullptr;
+static dl::Model *s_regresor = nullptr;
+static int s_regresor_cluster = -1;
+static int s_candidato_cluster = -1;
+static int s_candidato_repeticiones = 0;
+static uint8_t *s_captura = nullptr;
+static uint8_t *s_procesamiento = nullptr;
+static SemaphoreHandle_t s_lock = nullptr;
+static bool s_captura_pendiente = false;
+static bool s_tarea_iniciada = false;
+static int64_t s_ultima_captura = 0;
+
+static size_t libre_psram() { return heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024; }
+static size_t bloque_psram() { return heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024; }
+
+static bool tensor_valido(dl::TensorBase *t, int elementos)
+{
+    if (!t || !t->data || !t->get_element_ptr()) return false;
+    return t->get_size() >= elementos;
+}
+
+static dl::Model *cargar_desde_particion(const char *particion, int salida_minima)
+{
+    ESP_LOGI(TAG, "Cargando %s. PSRAM libre=%u KB, mayor=%u KB", particion,
+             (unsigned)libre_psram(), (unsigned)bloque_psram());
+
+    // param_copy=false mantiene parámetros en Flash para evitar duplicarlos en PSRAM.
+    // La primera prueba debe comprobar el tiempo de inferencia y los tensores en placa.
+    dl::Model *m = new (std::nothrow) dl::Model(particion,
+                          fbs::MODEL_LOCATION_IN_FLASH_PARTITION,
+                          0, dl::MEMORY_MANAGER_GREEDY, nullptr, false);
+    if (!m) return nullptr;
+    auto &in = m->get_inputs();
+    auto &out = m->get_outputs();
+    if (in.size() != 1 || out.size() != 1 ||
+        !tensor_valido(in.begin()->second, DST_W*DST_H*3) ||
+        !tensor_valido(out.begin()->second, salida_minima)) {
+        ESP_LOGE(TAG, "Tensores incorrectos o sin memoria: %s", particion);
+        delete m;
+        return nullptr;
+    }
+    dl::TensorBase *ti = in.begin()->second;
+    if (ti->shape.size() != 4 || ti->shape[0] != 1 || ti->shape[1] != DST_H ||
+        ti->shape[2] != DST_W || ti->shape[3] != 3 ||
+        (ti->dtype != dl::DATA_TYPE_FLOAT && ti->dtype != dl::DATA_TYPE_INT8)) {
+        ESP_LOGE(TAG, "Entrada incompatible: %s dtype=%d", particion, (int)ti->dtype);
+        delete m;
+        return nullptr;
+    }
+    ESP_LOGI(TAG, "%s OK. entrada dtype=%d salida dtype=%d exp=%d",particion,
+             (int)ti->dtype,(int)out.begin()->second->dtype, out.begin()->second->exponent);
+    return m;
+}
+
+extern "C" void vpr_runtime_preload(void)
+{
+    if (s_lock) return;
+    s_lock = xSemaphoreCreateMutex();
+    if (!s_lock) return;
+    // ANTES de iniciar la MIPI-CSI: solo 2 CNN residentes (principal + c0).
+    s_principal = cargar_desde_particion("vpr_main", 4);
+    s_regresor = cargar_desde_particion("vpr_c0", 2);
+    if (s_regresor) s_regresor_cluster = 0;
+    s_captura = (uint8_t*)heap_caps_malloc(SNAP_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_procesamiento = (uint8_t*)heap_caps_malloc(SNAP_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_captura || !s_procesamiento)
+        ESP_LOGE(TAG,"No se pudo reservar snapshot VPR doble (2x%u bytes)",(unsigned)SNAP_BYTES);
+}
+
+static inline uint16_t px565(const uint8_t *foto,int x,int y)
+{
+    const size_t i=((size_t)y*SRC_W + x)*2;
+    return (uint16_t)foto[i] | ((uint16_t)foto[i+1]<<8);
+}
+static inline void rgb565_a_float(uint16_t p,float v[3])
+{
+    v[0]=((p>>11)&31)*(1.0f/31.0f);
+    v[1]=((p>>5)&63)*(1.0f/63.0f);
+    v[2]=(p&31)*(1.0f/31.0f);
+}
+static void preparar_entrada(dl::TensorBase *entrada, const uint8_t *foto)
+{
+    const bool es_float = (entrada->dtype==dl::DATA_TYPE_FLOAT);
+    float *dstf=es_float?entrada->get_element_ptr<float>():nullptr;
+    int8_t *dsti=es_float?nullptr:entrada->get_element_ptr<int8_t>();
+    const float escala=es_float?1.0f:DL_RESCALE(entrada->exponent);
+    for(int y=0;y<DST_H;++y){
+        float fy=((float)y+0.5f)*SRC_H/DST_H-0.5f;
+        int y0=(int)floorf(fy); float ay=fy-y0;
+        if(y0<0){y0=0;ay=0;} if(y0>=SRC_H-1){y0=SRC_H-2;ay=1;}
+        for(int x=0;x<DST_W;++x){
+            float fx=((float)x+0.5f)*SRC_W/DST_W-0.5f;
+            int x0=(int)floorf(fx); float ax=fx-x0;
+            if(x0<0){x0=0;ax=0;} if(x0>=SRC_W-1){x0=SRC_W-2;ax=1;}
+            float a[3],b[3],c[3],d[3];
+            rgb565_a_float(px565(foto,x0,y0),a);
+            rgb565_a_float(px565(foto,x0+1,y0),b);
+            rgb565_a_float(px565(foto,x0,y0+1),c);
+            rgb565_a_float(px565(foto,x0+1,y0+1),d);
+            size_t base=((size_t)y*DST_W+x)*3;
+            for(int k=0;k<3;++k){
+                float superior=a[k]+ax*(b[k]-a[k]);
+                float inferior=c[k]+ax*(d[k]-c[k]);
+                float v=superior+ay*(inferior-superior);
+                if(es_float)dstf[base+k]=v;
+                else dsti[base+k]=dl::quantize<int8_t>(v,escala);
+            }
+        }
+    }
+}
+static float salida_real(dl::TensorBase *t,int idx)
+{
+    if(t->dtype==dl::DATA_TYPE_FLOAT) return t->get_element_ptr<float>()[idx];
+    if(t->dtype==dl::DATA_TYPE_INT8) return ldexpf((float)t->get_element_ptr<int8_t>()[idx],t->exponent);
+    if(t->dtype==dl::DATA_TYPE_INT16) return ldexpf((float)t->get_element_ptr<int16_t>()[idx],t->exponent);
+    return NAN;
+}
+static void mostrar(const char *estado,float x,float y,bool valido)
+{
+    if(bsp_display_lock(100)){
+        ui_extra_vpr_set_coordinates(x,y,valido);
+        ui_extra_vpr_set_status(estado);
+        bsp_display_unlock();
+    }
+}
+static void tarea_vpr(void *unused)
+{
+    (void)unused;
+    ESP_LOGI(TAG,"Tarea jerarquica iniciada: 1 imagen/s");
+    while(true){
+        if(ui_extra_get_current_page()!=UI_PAGE_VPR || !s_lock || !s_captura || !s_procesamiento){
+            vTaskDelay(pdMS_TO_TICKS(100));continue;
+        }
+        if(!s_principal){
+            mostrar("CNN principal no cargada (ver monitor)",0,0,false);
+            vTaskDelay(pdMS_TO_TICKS(500));continue;
+        }
+        if(xSemaphoreTake(s_lock,pdMS_TO_TICKS(20))!=pdTRUE){vTaskDelay(pdMS_TO_TICKS(30));continue;}
+        if(!s_captura_pendiente){xSemaphoreGive(s_lock);vTaskDelay(pdMS_TO_TICKS(30));continue;}
+        // Esta copia queda PRIVADA durante las dos inferencias.
+        memcpy(s_procesamiento,s_captura,SNAP_BYTES);
+        s_captura_pendiente=false;
+        xSemaphoreGive(s_lock);
+
+        const int64_t inicio=esp_timer_get_time();
+        preparar_entrada(s_principal->get_input(),s_procesamiento);
+        s_principal->run();
+        dl::TensorBase *out=s_principal->get_output();
+        if(!out || !out->get_element_ptr()){mostrar("Error salida principal",0,0,false);continue;}
+        float mejor=-INFINITY;int cluster=-1;
+        for(int i=0;i<4;++i){
+            const float v=salida_real(out,i);
+            if(isfinite(v) && v>mejor){mejor=v;cluster=i;}
+        }
+        if(cluster<0){mostrar("Cluster invalido",0,0,false);continue;}
+        const vpr_modo_t modo=ui_extra_vpr_get_mode();
+        char estado[96];
+        if(modo==VPR_MODO_CLASIFICACION){
+            snprintf(estado,sizeof(estado),"CLUSTER: %d  |  score: %.2f",cluster,mejor);
+            ESP_LOGI(TAG,"CLUSTER=%d score=%.3f",cluster,mejor);
+            mostrar(estado,0,0,false); // Se muestra clúster; no se inventan X,Y.
+            continue;
+        }
+        // Estabilidad: dos predicciones iguales antes de cambiar de regresor.
+        if(cluster==s_regresor_cluster){s_candidato_cluster=-1;s_candidato_repeticiones=0;}
+        else if(cluster==s_candidato_cluster){++s_candidato_repeticiones;}
+        else{s_candidato_cluster=cluster;s_candidato_repeticiones=1;}
+        if(cluster!=s_regresor_cluster && s_candidato_repeticiones>=2){
+            ESP_LOGI(TAG,"Cambiando regresor %d -> %d",s_regresor_cluster,cluster);
+            delete s_regresor;
+            s_regresor=nullptr;
+            s_regresor_cluster=-1;
+            s_regresor=cargar_desde_particion(ETIQUETAS_REG[cluster],2);
+            if(s_regresor)s_regresor_cluster=cluster;
+            s_candidato_repeticiones=0;
+        }
+        if(!s_regresor || s_regresor_cluster!=cluster){
+            snprintf(estado,sizeof(estado),"CL: %d  |  ajustando regresor...",cluster);
+            mostrar(estado,0,0,false);
+            continue;
+        }
+        preparar_entrada(s_regresor->get_input(),s_procesamiento);
+        s_regresor->run();
+        dl::TensorBase *r=s_regresor->get_output();
+        if(!r || !r->get_element_ptr()){mostrar("Error salida regresor",0,0,false);continue;}
+        const float xn=salida_real(r,0),yn=salida_real(r,1);
+        const float x=xn*VPR_JER_ESCALA_X+VPR_JER_MIN_X;
+        const float y=yn*VPR_JER_ESCALA_Y+VPR_JER_MIN_Y;
+        const unsigned ms=(unsigned)((esp_timer_get_time()-inicio)/1000);
+        const bool valido=isfinite(x)&&isfinite(y);
+        snprintf(estado,sizeof(estado),"JER: CL%d | %u ms | 1 foto/s",cluster,ms);
+        ESP_LOGI(TAG,"CL=%d X=%.3f Y=%.3f t=%u ms",cluster,x,y,ms);
+        if(ui_extra_get_current_page()==UI_PAGE_VPR && modo==ui_extra_vpr_get_mode())
+            mostrar(estado,x,y,valido);
+    }
+}
+extern "C" void vpr_runtime_start(void)
+{
+    if(s_tarea_iniciada || !s_lock || !s_captura || !s_procesamiento)return;
+    BaseType_t ok=xTaskCreatePinnedToCore(tarea_vpr,"VPR_jerarquico",8192,nullptr,3,nullptr,1);
+    s_tarea_iniciada=(ok==pdPASS);
+    if(!s_tarea_iniciada)ESP_LOGE(TAG,"Error al crear tarea VPR");
+}
+extern "C" void vpr_runtime_offer_frame(const uint8_t *foto,int width,int height)
+{
+    if(!s_tarea_iniciada || !s_lock || !s_captura || !foto || width!=SRC_W || height!=SRC_H)return;
+    if(ui_extra_get_current_page()!=UI_PAGE_VPR)return;
+    int64_t ahora=esp_timer_get_time();
+    if(ahora-s_ultima_captura<1000000LL)return;
+    if(xSemaphoreTake(s_lock,0)!=pdTRUE)return;
+    memcpy(s_captura,foto,SNAP_BYTES);
+    s_captura_pendiente=true;
+    s_ultima_captura=ahora;
+    xSemaphoreGive(s_lock);
+}

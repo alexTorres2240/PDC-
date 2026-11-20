@@ -922,7 +922,7 @@ static void vpr_update_mode_label(void)
 {
     if (!vpr_title_label) return;
     lv_label_set_text(vpr_title_label,
-        vpr_modo == VPR_MODO_CLASIFICACION ? "VPR | CLASIFICACION" : "VPR | REGRESION");
+        vpr_modo == VPR_MODO_CLASIFICACION ? "VPR | CLUSTER" : "VPR | JERARQUICO");
     if (vpr_coords_label) {
         lv_label_set_text(vpr_coords_label, "X: --  Y: --");
     }
@@ -962,7 +962,7 @@ static void ui_extra_redirect_to_vpr_page(void)
         lv_obj_set_style_pad_all(vpr_help_label, 4, 0);
         lv_obj_align(vpr_help_label, LV_ALIGN_BOTTOM_LEFT, 4, -5);
     }
-    lv_label_set_text(vpr_help_label, "UP/DOWN: modelo  MENU: salir\nSin inferencia en esta fase");
+    lv_label_set_text(vpr_help_label, "UP/DOWN: modelo  MENU: salir\nEsperando 1 fotograma/s");
     vpr_update_mode_label();
     lv_obj_clear_flag(vpr_title_label, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(vpr_coords_label, LV_OBJ_FLAG_HIDDEN);
@@ -985,12 +985,24 @@ void ui_extra_vpr_set_status(const char *mensaje)
 void ui_extra_vpr_set_coordinates(float x, float y, bool valid)
 {
     if (current_page != UI_PAGE_VPR || !vpr_coords_label) return;
+
     if (!valid) {
         lv_label_set_text(vpr_coords_label, "X: --  Y: --");
     } else if (vpr_modo == VPR_MODO_CLASIFICACION) {
-        lv_label_set_text_fmt(vpr_coords_label, "X: %.0f  Y: %.0f", x, y);
+        /* Las coordenadas de una loseta son enteras. */
+        int xi = (int)(x + (x >= 0.0f ? 0.5f : -0.5f));
+        int yi = (int)(y + (y >= 0.0f ? 0.5f : -0.5f));
+        lv_label_set_text_fmt(vpr_coords_label, "X: %d  Y: %d", xi, yi);
     } else {
-        lv_label_set_text_fmt(vpr_coords_label, "X: %.2f  Y: %.2f", x, y);
+        /* Regresion: imprimir decimales con enteros para no depender de %f
+           en el formateador reducido de LVGL. */
+        int x100 = (int)(x * 100.0f + (x >= 0.0f ? 0.5f : -0.5f));
+        int y100 = (int)(y * 100.0f + (y >= 0.0f ? 0.5f : -0.5f));
+        int ax = x100 < 0 ? -x100 : x100;
+        int ay = y100 < 0 ? -y100 : y100;
+        lv_label_set_text_fmt(vpr_coords_label, "X: %s%d.%02d  Y: %s%d.%02d",
+                              x100 < 0 ? "-" : "", ax / 100, ax % 100,
+                              y100 < 0 ? "-" : "", ay / 100, ay % 100);
     }
 }
 

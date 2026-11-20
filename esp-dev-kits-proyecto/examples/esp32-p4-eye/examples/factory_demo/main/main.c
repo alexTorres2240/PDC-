@@ -13,6 +13,7 @@
 #include "bsp/esp-bsp.h"
 
 #include "ui_extra.h"
+#include "app_vpr_runtime.h"
 
 #include "app_control.h"
 #include "app_video_stream.h"
@@ -37,6 +38,9 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    /* VPR_FASE2: reservar ambas CNN ANTES de las reservas grandes de CSI */
+    vpr_runtime_preload();
 
     // Initialize the flashlight
     ESP_LOGI(TAG, "Initialize the flashlight");
@@ -84,5 +88,7 @@ void app_main(void)
     ESP_ERROR_CHECK(app_video_stream_init(i2c_handle));
     
     ESP_LOGI(TAG, "Application initialization completed");
+    /* VPR_FASE2: tarea de inferencia tras iniciar la camara */
+    vpr_runtime_start();
 
 }

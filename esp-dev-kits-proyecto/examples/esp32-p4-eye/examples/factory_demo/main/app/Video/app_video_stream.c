@@ -24,6 +24,7 @@
 #include "app_storage.h"
 #include "app_isp.h"
 #include "app_video_stream.h"
+#include "app_vpr_runtime.h"
 #include "app_video_utils.h"
 #include "app_video_photo.h"
 #include "app_video_record.h"
@@ -621,6 +622,13 @@ static void camera_video_frame_operation(uint8_t *camera_buf, uint8_t camera_buf
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to process frame: 0x%x", ret);
         return;
+    }
+
+/* VPR_FASE2: camera -> inferencia a 1 Hz */
+    if (camera_state.flags.is_initialized && ui_extra_get_current_page() == UI_PAGE_VPR) {
+        /* Frame aun sin el swap de bytes RGB565 destinado a LVGL. */
+        vpr_runtime_offer_frame((const uint8_t *)camera_buffer.canvas_buf[camera_buf_index],
+                                BSP_LCD_H_RES, BSP_LCD_V_RES);
     }
 
     // Process frame for AI detection if we're on the AI detection page
